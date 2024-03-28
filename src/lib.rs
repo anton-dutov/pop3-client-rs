@@ -2,7 +2,7 @@ use std::io::BufRead;
 use std::io::{BufReader, Write};
 use std::net::TcpStream;
 
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{Bytes, BytesMut, Buf, BufMut};
 
 #[cfg(feature = "with-rustls")]
 use {
@@ -180,10 +180,15 @@ impl Client {
         let username_query = format!("USER {}\r\n", username);
         let password_query = format!("PASS {}\r\n", password);
 
-        self.query_string(&username_query, false)
+        self.query(&username_query, false)
             .and_then(|s1| {
-                self.query_string(&password_query, false)
-                    .map(|s2| format!("{}{}", s1, s2))
+                self.query(&password_query, false)
+                    .map(|s2| {
+                        let mut buf = BytesMut::with_capacity(64);
+                        buf.put(&s1[..]);
+                        buf.put(&s2[..]);
+                        buf.freeze()
+                    })
                     .map(|s| {
                         self.authorized = true;
                         s
@@ -208,7 +213,7 @@ impl Client {
     /// # }
     /// ```
     pub fn quit(mut self) -> Result<()> {
-        self.query_string("QUIT\r\n", false).map(|_| ())
+        self.query("QUIT\r\n", false).map(|_| ())
     }
 
     /// Display the statistics for the mailbox (that's what the `STAT` command does).
@@ -266,13 +271,13 @@ impl Client {
     /// The server may return an error response if:
     /// - The letter under the given index does not exist in the mailbox
     /// - The letter under the given index has been marked deleted
-    pub fn list(&mut self, msg: Option<u32>) -> Result<String> {
+    pub fn list(&mut self, msg: Option<u32>) -> Result<Bytes> {
         let query = if let Some(num) = msg {
             format!("LIST {}\r\n", num)
         } else {
             "LIST\r\n".to_string()
         };
-        self.query_string(&query, msg.is_none())
+        self.query(&query, msg.is_none())
     }
 
     /// Show the full content of the chosen message
@@ -295,61 +300,20 @@ impl Client {
     /// The server may return an error response if:
     /// - The letter under the given index does not exist in the mailbox
     /// - The letter under the given index has been marked deleted
-    pub fn retr(&mut self, msg: u32) -> Result<String> {
+    pub fn retr(&mut self, msg: u32) -> Result<Bytes> {
         let query = format!("RETR {}\r\n", msg);
-
-        #[cfg(feature = "with-encoding")]
-        {
-            let reply = self.query(&query, true)?;
-
-            let mut head = true;
-            let mut data = BytesMut::with_capacity(reply.len());
-
-            let mut charset: Option<String> = None;
-
-            for line in reply.split(|c| *c == b'\n').skip(1) {
-
-                data.put(&line[..]);
-                data.put_u8(b'\n');
-
-                if line == b"\r" {
-                    head = false;
-                }
-
-                if head && line.starts_with(b"Content-Type:") {
-                    let mut tmp = line.split(|c| *c == b'=');
-                    let prefix  = tmp.next().ok_or("Invalid charset")?;
-
-                    if prefix.ends_with(b"charset") {
-                        let cset = tmp.next().ok_or("Invalid charset")?;
-                        charset = Some(
-                            std::str::from_utf8(&cset[..cset.len()-1])
-                                .map_err(|_| String::from("INVALID_ENCODING"))?
-                                .to_lowercase()
-                        );
-                    }
-                }
-            }
-
-            Ok(if let Some(charset) = charset {
-                let encoding = encoding_rs::Encoding::for_label(charset.as_bytes())
-                    .ok_or_else(|| String::from("ENCODING_NOT_FOUND"))?;
-
-                let (data, _, _) = encoding.decode(&data);
-
-                data.to_string()
-            } else {
-                std::str::from_utf8(&data[..])
-                    .map_err(|_| String::from("INVALID_ENCODING"))?
-                    .to_string()
+        self.query(&query, true)
+            .map(|s| {
+                let tmp = join_bytes(
+                    &s[..]
+                        .split(|&b| b == b'\n')
+                        .skip(1)
+                        .collect::<Vec<&[u8]>>(),
+                    b'\n'
+                );
+                
+                Bytes::copy_from_slice(&tmp)
             })
-        }
-
-        #[cfg(not(feature = "with-encoding"))]
-        {
-            self.query_string(&query, true)
-                .map(|s| s.split('\n').skip(1).collect::<Vec<&str>>().join("\n"))
-        }
     }
 
 
@@ -373,9 +337,9 @@ impl Client {
     /// The server may return an error response if:
     /// - The letter under the given index does not exist in the mailbox
     /// - The letter under the given index has been marked deleted
-    pub fn dele(&mut self, msg: u32) -> Result<String> {
+    pub fn dele(&mut self, msg: u32) -> Result<Bytes> {
         let query = format!("DELE {}\r\n", msg);
-        self.query_string(&query, false)
+        self.query(&query, false)
     }
 
 
@@ -415,8 +379,8 @@ impl Client {
     /// #    Ok(())
     /// # }
     /// ```
-    pub fn rset(&mut self) -> Result<String> {
-        self.query_string("RSET\r\n", false)
+    pub fn rset(&mut self) -> Result<Bytes> {
+        self.query("RSET\r\n", false)
     }
 
     /// Show top n lines of a chosen message
@@ -467,13 +431,13 @@ impl Client {
     /// The server may return an error response if:
     /// - The letter under the given index does not exist in the mailbox
     /// - The letter under the given index has been marked deleted
-    pub fn uidl(&mut self, msg: Option<u32>) -> Result<String> {
+    pub fn uidl(&mut self, msg: Option<u32>) -> Result<Bytes> {
         let query = if let Some(num) = msg {
             format!("UIDL {}\r\n", num)
         } else {
             "UIDL\r\n".to_string()
         };
-        self.query_string(&query, msg.is_none())
+        self.query(&query, msg.is_none())
     }
 
     /// Authorise using the APOP method
@@ -497,12 +461,12 @@ impl Client {
     /// The server will return error if permission was denied.
     ///
     /// [RFC]: https://tools.ietf.org/html/rfc1081
-    pub fn apop(&mut self, name: &str, digest: &str) -> Result<String> {
+    pub fn apop(&mut self, name: &str, digest: &str) -> Result<Bytes> {
         if self.authorized {
             return Err("login is only allowed in Authorization stage".to_string());
         }
         let query = format!("APOP {} {}\r\n", name, digest);
-        self.query_string(&query, false).map(|s| {
+        self.query(&query, false).map(|s| {
             self.authorized = true;
             s
         })
@@ -646,3 +610,20 @@ impl Client {
             .map_err(|_| String::from("Error is not valid utf-8"))
     }
 }
+
+
+fn join_bytes(arrays: &[&[u8]], separator: u8) -> Vec<u8> {
+    let cap: usize = arrays.iter().map(|a| a.len()).sum();
+
+    let mut result = Vec::with_capacity(cap + arrays.len() - 1);
+    
+    for (i, array) in arrays.iter().enumerate() {
+        result.extend_from_slice(array);
+        if i < arrays.len() - 1 {
+            result.push(separator);
+        }
+    }
+
+    result
+}
+
